@@ -1,0 +1,346 @@
+#!/usr/bin/python3
+# process_images.py
+# 9/22/2020
+# Aidan Gray
+# aidan.gray@idg.jhu.edu
+#
+# This is a script to process a batch of images
+
+from astropy.io import fits
+from matplotlib import pyplot as plt
+import os
+import sys
+import numpy as np 
+import glob
+import PyGuide
+import csv
+
+# Switches ########################################
+PIXEL_OUTPUT = True
+DISPLAY_TARGETS = False
+POLAR_OUTPUT = False
+SUBTRACT_BIAS = False
+SUBTRACT_DARK = False
+BIAS_FILE = 'avg_bias_-10.fits'
+DARK_FILE = ''
+SAVE_PROCESSED_IMAGE = False
+###################################################
+
+# Constants #######################################
+ZERO_PIXEL_DELTA = [0, 0]
+ZERO_PIXEL = [1375,1100]  # center of 2750x2200
+# ZERO_PIXEL_DELTA = [-218, -110]
+# ZERO_PIXEL = [1119,995]  # center of 2750x2200
+PIXEL_SIZE = 0.00454  # mm
+MASK_X_LEFT = -1375
+MASK_X_RIGHT = 1375
+MASK_Y_BOTTOM = -1100
+MASK_Y_TOP = 1100
+# MASK_X_LEFT = 780
+# MASK_X_RIGHT = 900
+# MASK_Y_BOTTOM = 860
+# MASK_Y_TOP = 940
+###################################################
+
+# CCD Parameters for PyGuide init #################
+BIAS_LEVEL = 0  # subtraction done using bias image
+GAIN = 0.27  # e-/ADU
+READ_NOISE = 3.5  # e-
+MAX_COUNTS = 65536
+FULL_WELL = 17000
+###################################################
+
+def write_to_csv(dataFile, dataList):
+    print("Writing data to "+dataFile)
+    with open(dataFile, 'w', newline='') as dF:
+        wr = csv.writer(dF, dialect='excel', delimiter = ',')
+        if POLAR_OUTPUT:
+            wr.writerow(['r','theta','z','expTime','filter','flux','counts','fwhm','bkgnd','chiSq'])
+        elif PIXEL_OUTPUT:
+            wr.writerow(['x-pix','y-pix','z','expTime','filter','flux','counts','fwhm','bkgnd','chiSq'])
+        else:
+            wr.writerow(['x','y','z','expTime','filter','flux','counts','fwhm','bkgnd','chiSq'])
+
+        for imageData in dataList:
+            wr.writerows(imageData)
+    print("Done")
+
+def cart2polar(fp_coords):
+    """
+    Takes a list of cartesian coordinates and converts them to polar coordinates.
+    This isn't normally used, but if the CSV file must contain cartesian coords,
+    this function may be implemented after reading in CSV.
+
+    Input:
+    - fp_coords     List of cartesian coordinates
+
+    Output:
+    - polar_coords  List of polar coordinates
+    """
+
+    polar_coords = []
+
+    for tCoords in fp_coords:
+        x = tCoords[0]
+        y = tCoords[1]
+
+        r = np.sqrt(x**2+y**2)
+        
+        # change this around depending on orientation on -scope
+        if x == 0:
+            t = 90
+        elif y == 0:
+            t = 0
+        else:
+            t = np.arctan2(y,x)
+
+        t = -1*(np.rad2deg(t)-90)
+        polar_coords.append([r,t])
+
+    return polar_coords
+
+def convert_pixel_to_rtheta(xPixel, yPixel, rStage, tStage):
+    tTemp = np.deg2rad(-1*tStage) #convert the stage's position(deg) to radians and change sign
+    tCos = np.cos(tTemp)
+    tSin = np.sin(tTemp)
+
+    xTemp = rStage * np.cos(np.deg2rad(90-tStage))
+    yTemp = rStage * np.sin(np.deg2rad(90-tStage))
+
+    transformMatrix = [[tCos,   -tSin,  xTemp],
+                       [tSin,   tCos,   yTemp],
+                       [0,      0,      1]]    
+    
+    # convert from Pixel coordinates to mm from ccd center
+    xPixCoord = (xPixel - ZERO_PIXEL[0]) * PIXEL_SIZE
+    yPixCoord = (yPixel - ZERO_PIXEL[1]) * PIXEL_SIZE
+
+    ccdMatrix = [[xPixCoord],
+                 [yPixCoord],
+                 [1]]
+
+    trans_cart = np.dot(transformMatrix, ccdMatrix)
+    # Adjust coordinate system
+    #trans_cart[0][0] = trans_cart[0][0] - ( (ZERO_PIXEL_DELTA[0]*tCos + ZERO_PIXEL_DELTA[1]*tSin) * PIXEL_SIZE)
+    #trans_cart[1][0] = trans_cart[1][0] - ( (ZERO_PIXEL_DELTA[1]*tCos + ZERO_PIXEL_DELTA[0]*tSin) * PIXEL_SIZE)
+
+    trans_cart[0][0] = trans_cart[0][0] - (ZERO_PIXEL_DELTA[0] * PIXEL_SIZE)
+    trans_cart[1][0] = trans_cart[1][0] - (ZERO_PIXEL_DELTA[1] * PIXEL_SIZE)
+
+    if POLAR_OUTPUT:
+        polar_coords = cart2polar([[trans_cart[0][0],trans_cart[1][0]]])
+        rVal = polar_coords[0][0]
+        thetaVal = polar_coords[0][1]
+        return rVal,thetaVal
+    else:
+        xTmp = trans_cart[0][0]
+        yTmp = trans_cart[1][0]
+        return xTmp, yTmp
+
+
+def pyguide_checking(imgArray):
+    """
+    Uses PyGuide to find stars, get counts, and determine if new exposure time is necessary.
+
+    Input:
+    - imgArray  numpy array from the CCD
+
+    Output:
+    - True if exposure was good, False if bad
+    - True if exposure time should be decreased, False if increased
+    """
+    # search image for stars
+    centroidData, imageStats = PyGuide.findStars(
+        imgArray,
+        mask = maskArray,
+        satMask = None,
+        ccdInfo = CCDInfo
+        )
+
+    # keep track of targets
+    goodTargets = []
+    lowTargets = 0
+    highTargets = 0
+
+    print("these are the %i targets pyguide found in descending order of brightness:"%len(centroidData))
+    for centroid in centroidData:
+        # for each star, measure its shape
+        shapeData = PyGuide.starShape(
+            np.asarray(imgArray, dtype="float32"), # had to explicitly cast for some reason
+            mask = None,
+            xyCtr = centroid.xyCtr,
+            rad = centroid.rad
+        )
+        if not shapeData.isOK:
+            print("starShape failed: %s" % (shapeData.msgStr,))
+        else:
+            print("xyCenter=[%.2f, %.2f] CCD Pixel Counts=%.1f, FWHM=%.1f, BKGND=%.1f, chiSq=%.2f" %\
+                (centroid.xyCtr[0], centroid.xyCtr[1], shapeData.ampl,shapeData.fwhm, shapeData.bkgnd, shapeData.chiSq))
+            #if shapeData.ampl < 0.2*MAX_COUNTS:
+            #    lowTargets+=1
+            #elif shapeData.ampl > 0.9*MAX_COUNTS:
+            #    highTargets+=1
+            #else:
+            #    goodTargets.append([centroid,shapeData])
+            goodTargets.append([centroid,shapeData])
+    print()
+
+    print(str(len(goodTargets))+" targets are in the linear (20-90%) range --- "+str(lowTargets)+" low targets --- "+str(highTargets)+" high targets")
+
+    ### highlight detections
+    ### size of green circle scales with total counts
+    ### bigger circles for brigher stars
+    if DISPLAY_TARGETS:
+        plt.clf()
+        plt.imshow(imgArray, cmap="gray", vmin=200, vmax=MAX_COUNTS) # vmin/vmax help with contrast
+        plt.ion()
+        plt.show()
+        for centroid in centroidData:
+            xyCtr = centroid.xyCtr + np.array([-0.5, -0.5]) # offset by half a pixel to match imshow with 0,0 at pixel center rather than edge
+            counts = centroid.counts
+            plt.scatter(xyCtr[0], xyCtr[1], s=counts/MAX_COUNTS, marker="o", edgecolors="lime", facecolors="none")
+        plt.gca().invert_yaxis()
+        plt.draw()
+        plt.pause(0.1)
+
+    # Successful exposure, return True. The False is thrown away
+    if len(goodTargets) >= 1:
+        goodTargets = [goodTargets[0]]
+    return goodTargets
+
+def single_image(fileName):
+    """
+    Function to process a single raw FITS.
+
+    Input:
+    - fileName      Name of absolute path to the raw FITS file
+
+    Output:
+    - dataList      List of coordinate points & data
+    """
+    rawFile = fits.open(fileName)
+    rawData = rawFile[0].data
+    rawHdr = rawFile[0].header
+
+    dataList = []
+
+    rStage = rawHdr['R_POS']
+    tStage = rawHdr['T_POS']
+    zTarg = rawHdr['Z_POS']
+    filtTarg = rawHdr['FILTER']
+    #filtTarg = '1'
+    expTime = rawHdr['EXPTIME']
+    
+    if SUBTRACT_BIAS:
+        biasFile = fits.open('../bias-set/'+BIAS_FILE)
+        biasData = biasFile[0].data
+        prcData = np.subtract(rawData,biasData)
+    else:
+        prcData = rawData
+
+    goodTargets = pyguide_checking(prcData)
+
+    if len(goodTargets) > 0:
+        #dataList.append([fileName])
+        for target in goodTargets:
+            xPixel = target[0].xyCtr[0]
+            yPixel = target[0].xyCtr[1]
+
+            fluxTarg = target[0].counts
+            countsTarg = target[1].ampl
+            fwhmTarg = target[1].fwhm
+            bkgndTarg = target[1].bkgnd
+            chiSqTarg = target[1].chiSq
+
+            #convert xPixel,yPixel to r,t
+            if not PIXEL_OUTPUT:
+                rTarg, thetaTarg = convert_pixel_to_rtheta(xPixel, yPixel, rStage, tStage)
+                targetData = [rTarg, thetaTarg, zTarg, expTime, filtTarg, fluxTarg, countsTarg, fwhmTarg, bkgndTarg, chiSqTarg]
+            else:
+                targetData = [xPixel, yPixel, zTarg, expTime, filtTarg, fluxTarg, countsTarg, fwhmTarg, bkgndTarg, chiSqTarg]
+
+
+            dataList.append(targetData)
+
+    if SAVE_PROCESSED_IMAGE:
+        tmpFileName = fileName.split('raw')[1]
+        prcFileName = 'prc'+tmpFileName
+        fits.writeto(filePath+prcFileName, prcData, rawHdr)
+
+    return dataList, prcData, rawHdr
+
+def loop_thru_dir(filePath):
+    """
+    Function to loop through given directory and open all raw FITS.
+
+    Input:
+    - filePath      Name of the directory containing the raw FITS files
+
+    Output:
+    - dataList      List of coordinate points & data
+    """
+    combData = None
+    dataList = []
+    directoryList = glob.glob(filePath+'raw-*')
+    directoryList.sort(key=lambda f: int(''.join(filter(str.isdigit, f))))
+
+    print("Processing images in: "+filePath)
+    #print("List of filenames: "+repr(directoryList))
+
+    for fileName in directoryList:
+        #print(f"Processing: {fileName}")
+        dataListTemp, prcData, rawHdr = single_image(fileName)
+
+        dataList.append(dataListTemp)
+        if combData is None:
+            combData = prcData
+        else:
+            combData = combData + prcData
+
+    return dataList, combData, rawHdr
+
+if __name__ == "__main__":
+    filePath = sys.argv[1]
+    dataFile = sys.argv[2]
+
+    #filePath = input("Enter path to file (eg. ~/Pictures/SX_CCD): ")
+    #dataFile = input("Enter desired output file (eg. data.csv): ")
+
+    if filePath[0] == '~':
+        filePath = os.path.expanduser('~')+filePath[1:]
+
+    if dataFile[0] == '~':
+        dataFile = os.path.expanduser('~')+dataFile[1:]
+
+    CCDInfo = PyGuide.CCDInfo(
+        bias = BIAS_LEVEL,    # image bias, in ADU
+        readNoise = READ_NOISE, # read noise, in e-
+        ccdGain = GAIN,  # inverse ccd gain, in e-/ADU
+        )
+
+    maskArray = np.ones((2200, 2750))
+
+    for row in range(MASK_Y_BOTTOM, MASK_Y_TOP+1):
+        for col in range(MASK_X_LEFT, MASK_X_RIGHT+1):
+            maskArray[row][col] = 0
+
+    if filePath[len(filePath)-5:] == '.fits':
+        dataListTemp = single_image(filePath)
+        dataList = []
+        dataList.append(dataListTemp)
+        write_to_csv(dataFile+".csv", dataList)
+
+    else:
+        if filePath[len(filePath)-1] != '/':
+            filePath = filePath+'/'
+
+        if not os.path.exists(filePath):
+            print("ERROR: That file path does not exist.")
+            sys.exit()
+        else:
+            dataList, combData, lastHdr = loop_thru_dir(filePath)
+            #print(dataList)
+            write_to_csv(dataFile+".csv", dataList)
+            fits.writeto(dataFile+".fits", combData, lastHdr)
+
+    #input("Press ENTER to exit")
